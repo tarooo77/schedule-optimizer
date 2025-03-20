@@ -1,44 +1,31 @@
 import pandas as pd
 import numpy as np
 from scipy.optimize import linear_sum_assignment
-from collections import defaultdict, deque
-import itertools
-import copy
+import random
 
 class ScheduleOptimizer:
     def __init__(self):
+        # 基本設定
         self.DAYS = ['火曜日', '水曜日', '木曜日', '金曜日']
         self.TIMES = ['10時', '11時', '12時', '14時', '15時', '16時', '17時']
-        self.SLOTS_PER_DAY = 7
-        self.MAX_STUDENTS_PER_TEACHER = 21  # 1講師あたりの最大生徒数
-        self.MAX_ATTEMPTS = 50  # 試行回数を削減
-        self.MAX_RECURSIVE_DEPTH = 5  # 再帰の深さを削減
-        self.MAX_CHAIN_LENGTH = 3  # チェーンの長さを削減
-        self.LOCAL_SEARCH_ITERATIONS = 20  # 局所探索の反復回数を削減
-        self.MAX_SWAP_ATTEMPTS = 10  # スワップ試行回数を削減
-        self.MAX_RELAXATION_ATTEMPTS = 3  # 制約緩和の最大試行回数を削減
         
-        # 動的コスト設定（初期値）
+        # 全スロットを生成（28スロット）
+        self.all_slots = []
+        for day in self.DAYS:
+            for time in self.TIMES:
+                self.all_slots.append(f'{day}{time}')
+        
+        # 希望の重み付け（より強いペナルティを設定）
         self.PREFERENCE_COSTS = {
-            '第1希望': -2000,  # より強い選好
-            '第2希望': -1000,
-            '第3希望': -500,
-            '希望外': 500  # ペナルティを軽減
+            '第1希望': -1000,
+            '第2希望': -500,
+            '第3希望': -100,
+            '希望外': 5000
         }
         
-        # 各講師は1ヶ月に3スロットまで担当可能
-        self.teacher_schedules = {}
-        days_patterns = [
-            ['火曜日', '水曜日', '木曜日'],  # 金曜日休み
-            ['火曜日', '木曜日', '金曜日'],  # 水曜日休み
-            ['火曜日', '水曜日', '金曜日'],  # 木曜日休み
-            ['水曜日', '木曜日', '金曜日']   # 火曜日休み
-        ]
-        
-        # 34名の講師を設定
-        for i in range(34):
-            pattern = days_patterns[i % len(days_patterns)]
-            self.teacher_schedules[f'先生{i+1}'] = pattern.copy()
+        # 最大試行回数を増やす
+        self.MAX_ATTEMPTS = 1000
+        self.MAX_LOCAL_ATTEMPTS = 50
 
     def _adjust_preference_costs(self, unassigned_count):
         """未割り当て数に応じてコストを動的に調整"""
@@ -89,16 +76,14 @@ class ScheduleOptimizer:
     def _try_local_reassignment(self, assignments, students, problem_slots):
         """局所的な再割り当てを試行"""
         improved = False
-        max_iterations = 20  # 最大反復回数を制限
         iteration = 0
         
-        for slot in problem_slots:
-            if iteration >= max_iterations:
-                break
-                
-            interested_students = self._get_students_by_slot(students, slot)
-            if not interested_students:
-                continue
+        # 各問題スロットに対して再割り当てを試みる
+        while iteration < self.MAX_LOCAL_ATTEMPTS and not improved:
+            for slot in problem_slots:
+                interested_students = self._get_students_by_slot(students, slot)
+                if not interested_students:
+                    continue
             
             # 現在の割り当てを持つ生徒を優先度順にソート
             interested_students.sort(key=lambda x: {
@@ -284,188 +269,131 @@ class ScheduleOptimizer:
         """スケジュールの最適化を実行"""
         students = preferences_df.to_dict('records')
         best_assignments = None
-        min_unassigned = float('inf')
-        best_cost = float('inf')
+        min_unwanted = float('inf')
+        num_students = len(students)
+        num_slots = len(self.all_slots)
         
-        # 全スロットの利用可能教師を事前計算
-        slot_teachers = {}
-        for day in self.DAYS:
-            for time in self.TIMES:
-                slot = f'{day}{time}'
-                available_teachers = [
-                    t for t in self.teacher_schedules
-                    if day in self.teacher_schedules[t]
-                ]
-                if available_teachers:
-                    slot_teachers[slot] = available_teachers
-        
-        # 未割り当て＝0かつ希望外＝0の解が見つかるまで繰り返す
+        # 最適化の試行回数をカウント
         attempt = 0
+        
         while attempt < self.MAX_ATTEMPTS:
-            # 各生徒の希望をスコア化
-            student_preferences = defaultdict(list)
-            for student in students:
-                preferences = self._get_slot_preferences(student)
-                for slot, pref_type in preferences:
-                    if slot in slot_teachers:
-                        score = {
-                            '第1希望': 100,
-                            '第2希望': 50,
-                            '第3希望': 25
-                        }[pref_type]
-                        student_preferences[student['生徒名']].append({
-                            'slot': slot,
-                            'score': score,
-                            'pref_type': pref_type
-                        })
+            # コスト行列を作成（生徒×スロット）
+            cost_matrix = np.zeros((num_students, num_slots))
             
-            # 初期割り当て
-            current_assignments = {}
-            slot_assignments = defaultdict(list)  # 各スロットの割り当て状況を追跡
-            teacher_assignments = defaultdict(int)  # 各講師の担当生徒数を追跡
-            current_cost = 0
-            
-            # 各生徒について、希望順に割り当てを試行
-            for student in students:
-                student_name = student['生徒名']
-                assigned = False
-                
-                # 各希望をスコア順にソート
-                prefs = sorted(
-                    student_preferences[student_name],
-                    key=lambda x: x['score'],
-                    reverse=True
-                )
-                
-                # 各希望について割り当てを試行
-                for pref in prefs:
-                    slot = pref['slot']
-                    # スロットの制約をチェック
-                    if len(slot_assignments[slot]) >= 1:  # 1スロットに1名まで
-                        continue
-                        
-                    # そのスロットの講師を確認
-                    available_teacher = None
-                    for teacher in slot_teachers[slot]:
-                        if teacher_assignments[teacher] < self.MAX_STUDENTS_PER_TEACHER:
-                            available_teacher = teacher
+            # 各生徒の各スロットに対するコストを計算
+            for i, student in enumerate(students):
+                for j, slot in enumerate(self.all_slots):
+                    # デフォルトは希望外のコスト
+                    cost = self.PREFERENCE_COSTS['希望外']
+                    
+                    # 希望に応じてコストを設定
+                    for pref_num in [1, 2, 3]:
+                        pref_key = f'第{pref_num}希望'
+                        if pref_key in student and student[pref_key] == slot:
+                            cost = self.PREFERENCE_COSTS[pref_key]
                             break
                     
-                    if available_teacher is not None:
-                        current_assignments[student_name] = {
-                            'slot': slot,
-                            'teacher': available_teacher
-                        }
-                        slot_assignments[slot].append(student_name)
-                        teacher_assignments[available_teacher] += 1
-                        current_cost += self.PREFERENCE_COSTS[pref['pref_type']]
-                        assigned = True
+                    cost_matrix[i, j] = cost
+            
+            # ハンガリアン法で最適な割り当てを計算
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            
+            # 割り当て結果を保存
+            assignments = {}
+            unwanted_count = 0
+            
+            for i, student in enumerate(students):
+                student_name = student['生徒名']
+                assigned_slot = self.all_slots[col_ind[i]]
+                
+                # 割り当てられたスロットが希望のどれに該当するか確認
+                pref_type = '希望外'
+                for pref_num in [1, 2, 3]:
+                    pref_key = f'第{pref_num}希望'
+                    if pref_key in student and student[pref_key] == assigned_slot:
+                        pref_type = pref_key
                         break
                 
-                if not assigned:
-                    # 未割り当ての場合、空いているスロットを探す
-                    for slot, assignments in slot_assignments.items():
-                        # スロットの制約をチェック
-                        if len(assignments) >= 1:  # 1スロットに1名まで
-                            continue
-                            
-                        # そのスロットの講師を確認
-                        available_teacher = None
-                        for teacher in slot_teachers[slot]:
-                            if teacher_assignments[teacher] < self.MAX_STUDENTS_PER_TEACHER:
-                                available_teacher = teacher
-                                break
-                        
-                        if available_teacher is not None:
-                            current_assignments[student_name] = {
-                                'slot': slot,
-                                'teacher': available_teacher
-                            }
-                            slot_assignments[slot].append(student_name)
-                            teacher_assignments[available_teacher] += 1
-                            current_cost += self.PREFERENCE_COSTS['希望外']
-                            break
-            
-            # 未割り当ての生徒を特定
-            unassigned = [s for s in students if s['生徒名'] not in current_assignments]
-            
-            # 未割り当てがなく、希望外もない解を探す
-            if len(unassigned) == 0:
-                # 希望外の割り当てがないか確認
-                has_unwanted = False
-                for student_name, assignment in current_assignments.items():
-                    student = next(s for s in students if s['生徒名'] == student_name)
-                    slot = assignment['slot']
-                    if not any(slot == p[0] for p in self._get_slot_preferences(student)):
-                        has_unwanted = True
-                        break
+                if pref_type == '希望外':
+                    unwanted_count += 1
                 
-                if not has_unwanted:
+                assignments[student_name] = {
+                    'slot': assigned_slot,
+                    'pref_type': pref_type
+                }
+            
+            # より良い解が見つかった場合は更新
+            if unwanted_count < min_unwanted:
+                min_unwanted = unwanted_count
+                best_assignments = assignments.copy()
+                
+                if unwanted_count == 0:
                     print(f"最適な解が見つかりました！（試行回数: {attempt + 1}回）")
-                    best_assignments = current_assignments.copy()
                     break
+                else:
+                    print(f"改善された解が見つかりました（希望外: {unwanted_count}名）")
+            
+            # コストを動的に調整
+            if unwanted_count > 0:
+                self.PREFERENCE_COSTS['希望外'] *= 1.1
             
             attempt += 1
-            
-            # 制約をリセット
-            self._reset_constraints()
         
         if attempt >= self.MAX_ATTEMPTS:
-            raise Exception(f"試行回数{self.MAX_ATTEMPTS}回で最適な解が見つかりませんでした。")
-        
+            if best_assignments is None:
+                raise Exception(f"試行回数{self.MAX_ATTEMPTS}回で有効な解が見つかりませんでした。")
+            else:
+                print(f"試行回数{self.MAX_ATTEMPTS}回で希望外{min_unwanted}名の解が最良でした。")
+                
         # 結果を整形
-        results = []
+        assigned = []
+        unassigned = []
+        
         for student in students:
             result = {
-                'クライアント名': student['クライアント名'],
                 '生徒名': student['生徒名'],
                 '割当曜日': None,
                 '割当時間': None,
-                '担当講師': None,
                 '希望順位': None
             }
             
             assignment = best_assignments.get(student['生徒名'])
             if assignment:
                 slot_str = assignment['slot']
-                assigned_teacher = assignment['teacher']
                 # 割り当てられた時間枠から曜日と時間を分離
                 for day in self.DAYS:
                     if slot_str.startswith(day):
                         time = slot_str[len(day):]
                         result['割当曜日'] = day
                         result['割当時間'] = time
-                        result['担当講師'] = assigned_teacher
                         break
                 
-                # 希望順位を特定
-                preference = '希望外'
-                for pref_num in [1, 2, 3]:
-                    pref_key = f'第{pref_num}希望'
-                    if pref_key in student and student[pref_key] == slot_str:
-                        preference = pref_key
-                        break
-                result['希望順位'] = preference
-            
-            results.append(result)
+                result['希望順位'] = assignment['pref_type']
+                assigned.append(result)
+            else:
+                unassigned.append(result)
         
-        return results
+        return {'assigned': assigned, 'unassigned': unassigned}
 
-    def save_results(self, results, output_file):
-        """結果を保存して統計を表示"""
+    def display_results(self, results):
+        """結果を表示する"""
         if not results['assigned']:
             print("割り当てられた生徒がいません。")
             return
             
         df = pd.DataFrame(results['assigned'])
         
+        # 曜日順にソート
         day_order = {day: i for i, day in enumerate(self.DAYS)}
         df['day_order'] = df['割当曜日'].map(day_order)
-        df = df.sort_values(['クライアント名', 'day_order', '割当時間'])
+        df = df.sort_values(['day_order', '割当時間'])
         df = df.drop('day_order', axis=1)
         
-        df.to_csv(output_file, index=False, encoding='utf-8')
+        # 結果を表示
+        print("\n=== 最適化されたスケジュール ===")
+        print(df.to_string(index=False))
         
+        # 統計情報を表示
         print("\n=== スケジュール最適化結果 ===")
         print(f"割り当て完了: {len(results['assigned'])}名")
         print(f"未割り当て: {len(results['unassigned'])}名")
@@ -475,31 +403,99 @@ class ScheduleOptimizer:
         preference_counts = df['希望順位'].value_counts()
         total_students = len(df)
         for pref, count in preference_counts.items():
-            percentage = (count / total_students) * 100
+            percentage = count / total_students * 100
             print(f"{pref}: {count}名 ({percentage:.1f}%)")
         
-        # クライアントごとの希望順位の集計
-        print("\n=== クライアントごとの希望順位の集計 ===")
-        for client in sorted(df['クライアント名'].unique()):
-            client_df = df[df['クライアント名'] == client]
-            print(f"\n{client}:")
-            client_prefs = client_df['希望順位'].value_counts()
-            client_total = len(client_df)
-            for pref, count in client_prefs.items():
-                percentage = (count / client_total) * 100
-                print(f"{pref}: {count}名 ({percentage:.1f}%)")
-            
-            # クライアントごとの先生と曜日の割り当て状況
-            print("\n担当講師の割り当て:")
-            teacher_day_counts = client_df.groupby(['担当講師', '割当曜日']).size()
-            for (teacher, day), count in teacher_day_counts.items():
-                print(f"  {teacher} ({day}): {count}名")
+
+
+def create_dummy_data(num_students):
+    """ダミーデータを生成する関数"""
+    optimizer = ScheduleOptimizer()
+    data = []
+    for i in range(num_students):
+        # ランダムに3つの希望を選択
+        preferences = random.sample(optimizer.all_slots, 3)
+        data.append({
+            '生徒名': f'生徒{i+1}',
+            '第1希望': preferences[0],
+            '第2希望': preferences[1],
+            '第3希望': preferences[2]
+        })
+    return pd.DataFrame(data)
 
 def main():
+    print("スケジュール最適化プログラム\n")
+    
+    print("選択肢:")
+    print("1: ダミーデータでスケジュールを作成")
+    print("2: 実データを手動入力してスケジュールを作成")
+    
+    choice = input("\n選択肢を入力してください (1 or 2): ")
+    
     optimizer = ScheduleOptimizer()
-    preferences = pd.read_csv('student_preferences.csv')
-    results = optimizer.optimize_schedule(preferences)
-    optimizer.save_results(results, 'assigned_schedule.csv')
+    
+    if choice == '1':
+        # ダミーデータを生成
+        num_students = int(input("生徒数を入力してください: "))
+        preferences_df = create_dummy_data(num_students)
+        print(f"\nダミーデータを生成しました（{num_students}名）")
+        
+        # 生成されたダミーデータを表示
+        print("\n=== 生成されたダミーデータ ===")
+        print(preferences_df.to_string(index=False))
+        
+    elif choice == '2':
+        # 実データを手動入力
+        print("\n生徒の希望を手動で入力します")
+        num_students = int(input("生徒数を入力してください: "))
+        
+        data = []
+        
+        # 全スロットを表示
+        print("\n利用可能なスロット:")
+        for i, slot in enumerate(optimizer.all_slots):
+            print(f"{i+1}: {slot}")
+        
+        for i in range(num_students):
+            print(f"\n生徒{i+1}の情報を入力:")
+            student_name = input("生徒名: ")
+            if not student_name:
+                student_name = f"生徒{i+1}"
+                
+            # 希望スロットの入力
+            preferences = []
+            for j in range(3):
+                while True:
+                    try:
+                        slot_idx = int(input(f"第{j+1}希望のスロット番号: "))
+                        if 1 <= slot_idx <= len(optimizer.all_slots):
+                            preferences.append(optimizer.all_slots[slot_idx-1])
+                            break
+                        else:
+                            print(f"無効な番号です。1から{len(optimizer.all_slots)}の間で入力してください。")
+                    except ValueError:
+                        print("数字を入力してください。")
+            
+            data.append({
+                '生徒名': student_name,
+                '第1希望': preferences[0],
+                '第2希望': preferences[1],
+                '第3希望': preferences[2]
+            })
+        
+        preferences_df = pd.DataFrame(data)
+        print("\n=== 入力されたデータ ===")
+        print(preferences_df.to_string(index=False))
+        
+    else:
+        print("無効な選択肢です。")
+        return
+    
+    # スケジュールを最適化
+    results = optimizer.optimize_schedule(preferences_df)
+    
+    # 結果を表示
+    optimizer.display_results(results)
 
 if __name__ == "__main__":
     main()
